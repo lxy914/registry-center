@@ -10,8 +10,8 @@ interface ServiceNode {
   lastHeartbeat: number;
 }
 
-// 服务注册请求体（仅需serviceName+address）
-interface RegisterRequest {
+// 心跳/注册请求体（仅需serviceName+address）
+interface HeartbeatRequest {
   serviceName: string;
   address: string;
 }
@@ -54,20 +54,17 @@ app.use('*', async (c, next) => {
 
 // 工具函数：检查节点是否过期
 const isNodeExpired = (node: ServiceNode): boolean => {
-  return Date.now() - node.lastHeartbeat > HEARTBEAT_EXPIRE*1000;
+  return Date.now() - node.lastHeartbeat > HEARTBEAT_EXPIRE * 1000;
 };
 
 // 工具函数：清理单个服务的过期节点（仅操作内存，1次get+1次put）
 const cleanExpiredNodes = async (env: Env, serviceName: string): Promise<ServiceNode[]> => {
-  // 1. 仅1次get（核心优化：替代list遍历）
   const serviceStr = await env.register_center.get(serviceName);
   if (!serviceStr) return [];
 
-  // 2. 内存中过滤过期节点
   const nodes = JSON.parse(serviceStr) as ServiceNode[];
   const activeNodes = nodes.filter(node => !isNodeExpired(node));
 
-  // 3. 有活跃节点则更新，无则删除（避免空数据）
   if (activeNodes.length > 0) {
     await env.register_center.put(
       serviceName,
@@ -82,100 +79,72 @@ const cleanExpiredNodes = async (env: Env, serviceName: string): Promise<Service
 
 // 工具函数：清理所有服务的过期节点（仅健康检查时调用，低频）
 const cleanAllExpiredNodes = async (env: Env) => {
-  // 仅此处用list()，但健康检查调用频率低（比如每分钟1次），几乎不消耗次数
   const list = await env.register_center.list({ prefix: '' });
   for await (const key of list.keys) {
     await cleanExpiredNodes(env, key.name);
   }
 };
 
-// 1. 注册服务 (POST /register) —— 仅1次get+1次put
-app.post('/register', async (c) => {
-  try {
-    const body = await c.req.json<RegisterRequest>();
-    if (!body.serviceName || !body.address) {
-      return c.json({ code: 400, message: '缺少serviceName/address' }, 400);
-    }
-
-    // 1. 获取该服务现有节点（1次get）
-    const serviceStr = await c.env.register_center.get(body.serviceName);
-    const nodes: ServiceNode[] = serviceStr ? JSON.parse(serviceStr) : [];
-
-    // 2. 去重：避免重复注册
-    const isDuplicate = nodes.some(node => node.address === body.address);
-    if (isDuplicate) {
-      return c.json({ code: 200, message: '服务已注册'}, 200);
-    }
-
-    // 3. 添加新节点（初始化心跳）
-    nodes.push({
-      address: body.address,
-      lastHeartbeat: Date.now(),
-    });
-
-    // 4. 存储（1次put）
-    await c.env.register_center.put(
-      body.serviceName,
-      JSON.stringify(nodes),
-      { expirationTtl: KV_DEFAULT_TTL }
-    );
-
-    return c.json({
-      code: 200,
-      message: '服务注册成功',
-    });
-  } catch (error) {
-    console.error('注册失败:', error);
-    return c.json({ code: 500, message: '注册失败', error: (error as Error).message }, 500);
-  }
-});
-
-// 2. 心跳更新 (PUT /heartbeat) —— 仅1次get+1次put
+// 核心接口：心跳/注册二合一 (POST /heartbeat)
+// 首次调用 = 注册，后续调用 = 心跳更新，过期后调用 = 重新激活
 app.post('/heartbeat', async (c) => {
   try {
-    const body = await c.req.json<RegisterRequest>();
+    const body = await c.req.json<HeartbeatRequest>();
     if (!body.serviceName || !body.address) {
       return c.json({ code: 400, message: '缺少serviceName/address' }, 400);
     }
 
-    // 1. 获取该服务节点（1次get）
+    // 1. 获取该服务现有节点
     const serviceStr = await c.env.register_center.get(body.serviceName);
-    if (!serviceStr) {
-      return c.json({ code: 404, message: '服务未注册' }, 404);
-    }
-
-    // 2. 更新对应节点的心跳
-    const nodes = JSON.parse(serviceStr) as ServiceNode[];
+    let nodes: ServiceNode[] = serviceStr ? JSON.parse(serviceStr) : [];
     const nodeIndex = nodes.findIndex(node => node.address === body.address);
-    if (nodeIndex === -1) {
-      return c.json({ code: 404, message: '节点未注册' }, 404);
-    }
-    nodes[nodeIndex].lastHeartbeat = Date.now();
+    const now = Date.now();
 
-    // 3. 存储（1次put）
+    // 2. 分场景处理
+    let operationType: string;
+    if (nodeIndex === -1) {
+      // 场景1：节点不存在（首次注册/过期被删）→ 新增节点
+      nodes.push({
+        address: body.address,
+        lastHeartbeat: now,
+      });
+      operationType = 'register'; // 首次注册/重新激活
+    } else {
+      // 场景2：节点存在 → 更新心跳
+      nodes[nodeIndex].lastHeartbeat = now;
+      operationType = 'heartbeat'; // 心跳更新
+    }
+
+    // 3. 存储更新后的节点列表
     await c.env.register_center.put(
       body.serviceName,
       JSON.stringify(nodes),
       { expirationTtl: KV_DEFAULT_TTL }
     );
 
+    // 4. 返回不同场景的提示
+    const messages:{ [key: string]: string } = {
+      register: '节点首次注册成功（或已过期重新激活）',
+      heartbeat: '心跳更新成功'
+    };
     return c.json({
       code: 200,
-      message: '心跳更新成功',
+      message: messages[operationType],
       data: {
         serviceName: body.serviceName,
         address: body.address,
-        lastHeartbeat: nodes[nodeIndex].lastHeartbeat,
-        nextDeadline: nodes[nodeIndex].lastHeartbeat + HEARTBEAT_EXPIRE*1000,
+        lastHeartbeat: now,
+        nextDeadline: now + HEARTBEAT_EXPIRE * 1000,
+        operationType // 标识本次操作类型
       },
     });
   } catch (error) {
-    console.error('心跳更新失败:', error);
-    return c.json({ code: 500, message: '心跳失败', error: (error as Error).message }, 500);
+    console.error('心跳/注册失败:', error);
+    return c.json({ code: 500, message: '操作失败', error: (error as Error).message }, 500);
   }
 });
 
-// 3. 服务发现 (GET /discover) —— 仅1次get（核心优化）
+// 服务发现 (GET /discover)
 app.get('/discover', async (c) => {
   try {
     const serviceName = c.req.query('serviceName');
@@ -183,9 +152,7 @@ app.get('/discover', async (c) => {
       return c.json({ code: 400, message: '缺少serviceName参数' }, 400);
     }
 
-    // 1. 清理过期节点 + 获取活跃节点（仅1次get）
     const activeNodes = await cleanExpiredNodes(c.env, serviceName);
-
     return c.json({
       code: 200,
       message: '服务发现成功',
@@ -202,28 +169,25 @@ app.get('/discover', async (c) => {
   }
 });
 
-// 4. 注销服务 (DELETE /unregister) —— 仅1次get+1次put
+// 注销服务 (POST /unregister)
 app.post('/unregister', async (c) => {
   try {
-    const body = await c.req.json<RegisterRequest>();
+    const body = await c.req.json<HeartbeatRequest>();
     if (!body.serviceName || !body.address) {
       return c.json({ code: 400, message: '缺少serviceName/address' }, 400);
     }
 
-    // 1. 获取该服务节点（1次get）
     const serviceStr = await c.env.register_center.get(body.serviceName);
     if (!serviceStr) {
       return c.json({ code: 404, message: '服务未注册' }, 404);
     }
 
-    // 2. 过滤掉要注销的节点
     const nodes = JSON.parse(serviceStr) as ServiceNode[];
     const newNodes = nodes.filter(node => node.address !== body.address);
     if (newNodes.length === nodes.length) {
       return c.json({ code: 404, message: '节点未注册' }, 404);
     }
 
-    // 3. 更新存储（1次put/delete）
     if (newNodes.length > 0) {
       await c.env.register_center.put(body.serviceName, JSON.stringify(newNodes));
     } else {
@@ -240,14 +204,14 @@ app.post('/unregister', async (c) => {
   }
 });
 
-// 健康检查（低频调用list()，几乎不消耗次数）
+// 健康检查
 app.get('/health', async (c) => {
   await cleanAllExpiredNodes(c.env);
   return c.json({
     code: 200,
     message: '注册中心运行正常',
     timestamp: Date.now(),
-    heartbeatExpireMs: HEARTBEAT_EXPIRE,
+    heartbeatExpire: HEARTBEAT_EXPIRE,
     kvTtl: KV_DEFAULT_TTL
   });
 });
